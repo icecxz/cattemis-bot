@@ -1,0 +1,938 @@
+import asyncio
+import os
+import random
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import aiohttp
+import yt_dlp
+from dotenv import load_dotenv
+from yt_dlp.utils import DownloadError
+
+from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    Message,
+    FSInputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
+
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "elis~instagram-downloader-api")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден в .env")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+TIKWM_API = "https://www.tikwm.com/api/"
+
+TIKTOK_DOMAINS = {
+    "tiktok.com",
+    "www.tiktok.com",
+    "m.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+}
+INSTAGRAM_DOMAINS = {
+    "instagram.com",
+    "www.instagram.com",
+    "m.instagram.com",
+}
+TWITTER_DOMAINS = {
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "mobile.twitter.com",
+}
+YOUTUBE_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+}
+VIMEO_DOMAINS = {
+    "vimeo.com",
+    "www.vimeo.com",
+}
+
+ALLOWED_MEDIA_HOSTS = (
+    TIKTOK_DOMAINS
+    | INSTAGRAM_DOMAINS
+    | TWITTER_DOMAINS
+    | YOUTUBE_DOMAINS
+    | VIMEO_DOMAINS
+)
+
+GROUP_CHAT_TYPES = {"group", "supergroup"}
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS
+
+MEDIA_CONTENT_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+}
+
+RETRY_ATTEMPTS = 2
+RETRY_DELAY = 1.2
+
+ADMIN_CACHE_TTL = 60
+_admin_cache: dict[int, tuple[float, set[int]]] = {}
+
+PRAISE_REPLIES = [
+    "Хозяин, ты меня смущаешь (⁠｡⁠・⁠/⁠/⁠ε⁠/⁠/⁠・⁠｡⁠)",
+    "Хозяин, если ты продолжишь, я перегреюсь  ⁄⁠(⁠⁄⁠ ⁠⁄⁠•⁠⁄⁠-⁠⁄⁠•⁠⁄⁠ ⁠⁄⁠)⁠⁄",
+    "Похвала от Хозяина всегда самая лучшая ♡⁠(⁠Ӧ⁠ｖ⁠Ӧ⁠｡⁠)",
+    "Я засмущался, но рад это слышать 💫",
+    "Ты очень милый, спасибочки 💕",
+]
+
+PRAISE_KEYWORDS = [
+    "хороший бот",
+    "бот молодец",
+    "молодец бот",
+    "умничка",
+    "умница",
+    "лапочка",
+    "лучший бот",
+    "бот лучший",
+    "омежка",
+    "best bot",
+    "nice bot",
+    "похвалить бота",
+    "/goodbot",
+]
+
+
+def normalize_possible_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def host_matches(host: str, allowed_hosts: set[str]) -> bool:
+    host = (host or "").lower()
+    return any(host == item or host.endswith("." + item) for item in allowed_hosts)
+
+
+def is_tiktok(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host_matches(host, TIKTOK_DOMAINS)
+
+
+def is_instagram(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host_matches(host, INSTAGRAM_DOMAINS)
+
+
+def is_twitter(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host_matches(host, TWITTER_DOMAINS)
+
+
+def is_direct_image(url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(path.endswith(ext) for ext in IMAGE_EXTS)
+
+
+def is_allowed_media_link(url: str) -> bool:
+    url = normalize_possible_url(url)
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    if host_matches(host, ALLOWED_MEDIA_HOSTS):
+        return True
+
+    if any(path.endswith(ext) for ext in MEDIA_EXTS):
+        return True
+
+    return False
+
+
+def guess_ext_from_content_type(content_type: str | None, fallback: str = ".jpg") -> str:
+    if not content_type:
+        return fallback
+    content_type = content_type.split(";")[0].strip().lower()
+    return MEDIA_CONTENT_TYPES.get(content_type, fallback)
+
+
+def extract_urls_from_message(message: Message) -> list[str]:
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    urls = []
+
+    for entity in entities:
+        entity_type = str(entity.type)
+
+        if entity_type == "url":
+            raw = text[entity.offset: entity.offset + entity.length]
+            raw = normalize_possible_url(raw)
+            if raw:
+                urls.append(raw)
+
+        elif entity_type == "text_link" and entity.url:
+            raw = normalize_possible_url(entity.url)
+            if raw:
+                urls.append(raw)
+
+    dedup = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            dedup.append(url)
+
+    return dedup
+
+
+def is_praise_text(text: str) -> bool:
+    if not text:
+        return False
+
+    normalized = " ".join(text.lower().strip().split())
+    return any(keyword in normalized for keyword in PRAISE_KEYWORDS)
+
+
+def is_reply_to_this_bot(message: Message) -> bool:
+    reply = message.reply_to_message
+    if not reply or not reply.from_user:
+        return False
+    return reply.from_user.id == bot.id
+
+
+async def get_admin_ids(chat_id: int) -> set[int]:
+    now = time.monotonic()
+    cached = _admin_cache.get(chat_id)
+
+    if cached:
+        ts, ids = cached
+        if now - ts < ADMIN_CACHE_TTL:
+            return ids
+
+    admins = await bot.get_chat_administrators(chat_id)
+    ids = {member.user.id for member in admins}
+    _admin_cache[chat_id] = (now, ids)
+    return ids
+
+
+async def is_admin_message(message: Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if message.chat.type not in GROUP_CHAT_TYPES:
+        return False
+
+    admin_ids = await get_admin_ids(message.chat.id)
+    return message.from_user.id in admin_ids
+
+
+async def moderate_links(message: Message) -> tuple[bool, list[str]]:
+    urls = extract_urls_from_message(message)
+    if not urls:
+        return False, []
+
+    if message.chat.type not in GROUP_CHAT_TYPES:
+        return False, urls
+
+    if await is_admin_message(message):
+        return False, urls
+
+    has_bad_links = any(not is_allowed_media_link(url) for url in urls)
+
+    if has_bad_links:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return True, urls
+
+    return False, urls
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientOSError,
+        ),
+    ):
+        return True
+
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in {429, 500, 502, 503, 504}
+
+    text = str(exc).lower()
+    retry_markers = [
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "server disconnected",
+        "too many requests",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    return any(marker in text for marker in retry_markers)
+
+
+async def with_retry(func, *args, attempts: int = RETRY_ATTEMPTS, delay: float = RETRY_DELAY, **kwargs):
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+
+            if attempt >= attempts or not is_retryable_exception(e):
+                raise
+
+            await asyncio.sleep(delay)
+
+    raise last_error
+
+
+def human_ytdlp_error(error: Exception) -> str:
+    text = str(error).lower()
+
+    if "requested format is not available" in text:
+        return "Хозяин, нужна другая ссылка. Такое качество не помещается в мой животик (⁠╯⁠︵⁠╰⁠,⁠)."
+    if "unsupported url" in text or "not a valid url" in text:
+        return "Хозяин, кажется, эта ссылка нерабочая (⁠˘⁠･⁠_⁠･⁠˘⁠)"
+    if "private video" in text:
+        return "Хозяин, это видео приватное и я не могу его посмотреть (⁠￣⁠ヘ⁠￣⁠;⁠)"
+    if "sign in to confirm your age" in text or "age-restricted" in text:
+        return "Хозяин, не подумай ничего плохого, но я не могу скачивать видео с ограничениями по возрасту... (⁠；⁠^⁠ω⁠^⁠）"
+    if "video unavailable" in text:
+        return "Ой, Хозяин, это видео уже недоступно (⁠･⁠o⁠･⁠;⁠)"
+    if "http error 403" in text or "forbidden" in text:
+        return "Ай, сайт не разрешил скачать видео. :3"
+    if "timed out" in text:
+        return "Мм, сервер отвечает слишком долго... Попробуй ещё разочек чуть позже, зайка ^^"
+    return "Не получилось скачать это видео."
+
+
+def human_instagram_api_error(error: Exception) -> str:
+    text = str(error).lower()
+    if "apify_token" in text:
+        return "П-простите, хозяин... APIFY_TOKEN не задан... ૮(˶ㅠ︿ㅠ)ა"
+    if "http 401" in text or "http 403" in text:
+        return "П-простите, хозяин... Apify не принял токен... ૮(˶ㅠ︿ㅠ)ა"
+    if "http 402" in text:
+        return "Хозяин... у Apify, похоже, закончился баланс или лимит... ૮(˶ㅠ︿ㅠ)ა"
+    if "не вернул результатов" in text:
+        return "Хозяин... Apify ничего не нашёл по этой ссылке... простите... ૮(˶ㅠ︿ㅠ)ა"
+    if "не вернул прямые ссылки" in text:
+        return "Хозяин... Apify обработал ссылку, но не отдал прямые ссылки на медиа... ૮(˶ㅠ︿ㅠ)ა"
+    if "не удалось скачать медиафайлы" in text:
+        return "Хозяин... ссылки достать получилось, н-но сами файлы скачать не вышло... ૮(˶ㅠ︿ㅠ)ა"
+    if "timed out" in text:
+        return "Хозяин... Instagram через Apify отвечает слишком долго... попробуйте ещё разочек... ૮(˶ㅠ︿ㅠ)ა"
+
+    return "П-простите, хозяин... не получилось скачать Instagram через Apify... ૮(˶ㅠ︿ㅠ)ა"
+
+
+
+def human_twitter_error(error: Exception) -> str:
+    text = str(error).lower()
+
+    if "распарсить ссылку" in text:
+        return "П-простите, хозяин... я не понял ссылку на пост... ૮(˶ㅠ︿ㅠ)ა"
+    if "не вернул медиа" in text:
+        return "Хозяин... в этом посте не нашлось медиа... ૮(˶ㅠ︿ㅠ)ა"
+    if "404" in text:
+        return "Хозяин... пост не найден или его уже удалили... ૮(˶ㅠ︿ㅠ)ა"
+    if "403" in text:
+        return "П-простите, хозяин... тивттер не отдал данные по этому посту... ( . ‸ .)"
+    if "timed out" in text:
+        return "Хозяин... твиттер отвечает слишком долго... попробуйте ещё разочек... ( . ‸ .)"
+
+    return "П-простите, хозяин... не получилось скачать медиа из твиттера... ૮(˶ㅠ︿ㅠ)ა"
+async def safe_delete_message(message: Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def download_tiktok(url: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=40)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        )
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.post(TIKWM_API, data={"url": url, "hd": 1}) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+
+    if payload.get("code") != 0 or not payload.get("data"):
+        raise RuntimeError(payload.get("msg") or "TikWM не вернул данные")
+
+    return payload["data"]
+
+
+def extract_media_urls(obj) -> list[str]:
+    found = []
+    skip_keys = {
+        "thumbnail", "thumb", "avatar", "profile", "icon", "logo",
+        "permalink", "shortcode", "posturl", "pageurl"
+    }
+    good_keys = {
+        "video", "image", "photo", "display", "download",
+        "src", "media", "url", "play"
+    }
+
+    def walk(value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k).lower()
+
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    if any(bad in key for bad in skip_keys):
+                        pass
+                    elif any(ok in key for ok in good_keys):
+                        found.append(v)
+
+                walk(v)
+
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(obj)
+
+    dedup = []
+    seen = set()
+    for url in found:
+        if url not in seen:
+            seen.add(url)
+            dedup.append(url)
+    return dedup
+
+
+async def download_instagram_apify(url: str) -> dict:
+    if not APIFY_TOKEN:
+        raise RuntimeError("APIFY_TOKEN не задан")
+
+    endpoint = f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_ACTOR}/run-sync-get-dataset-items"
+    payload = {"url": [url]}
+    headers = {
+        "Authorization": f"Bearer {APIFY_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=90)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(endpoint, json=payload, headers=headers) as resp:
+            raw_text = await resp.text()
+
+            if resp.status >= 400:
+                raise RuntimeError(f"Apify HTTP {resp.status}: {raw_text[:300]}")
+
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                raise RuntimeError("Apify вернул не JSON")
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("Apify не вернул результатов")
+
+    caption = None
+    media_urls = []
+
+    for item in data:
+        if isinstance(item, dict):
+            if not caption:
+                for key in ("caption", "title", "text"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        caption = value.strip()
+                        break
+
+        media_urls.extend(extract_media_urls(item))
+
+    dedup_urls = []
+    seen = set()
+    for media_url in media_urls:
+        if media_url not in seen:
+            seen.add(media_url)
+            dedup_urls.append(media_url)
+
+    if not dedup_urls:
+        raise RuntimeError("Apify не вернул прямые ссылки на медиа")
+
+    temp_dir = tempfile.mkdtemp(prefix="apify_ig_")
+    files = []
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for i, media_url in enumerate(dedup_urls[:10], start=1):
+                async with session.get(media_url) as resp:
+                    resp.raise_for_status()
+
+                    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].lower()
+                    if not (
+                        content_type.startswith("image/")
+                        or content_type.startswith("video/")
+                        or content_type.startswith("audio/")
+                    ):
+                        continue
+
+                    parsed = urlparse(media_url)
+                    path_ext = Path(parsed.path).suffix.lower()
+                    ext = path_ext if path_ext in MEDIA_EXTS else guess_ext_from_content_type(content_type)
+
+                    file_path = Path(temp_dir) / f"ig_{i}{ext}"
+                    file_path.write_bytes(await resp.read())
+                    files.append(str(file_path))
+
+        if not files:
+            raise RuntimeError("Не удалось скачать медиафайлы из ссылок Apify")
+
+        return {
+            "temp_dir": temp_dir,
+            "files": files,
+            "caption": caption,
+        }
+
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def parse_twitter_url(url: str) -> tuple[str, str] | None:
+    try:
+        parts = [p for p in urlparse(url).path.split("/") if p]
+    except Exception:
+        return None
+
+    if len(parts) >= 3 and parts[1] == "status":
+        return parts[0], parts[2]
+
+    return None
+
+
+def extract_twitter_media_urls(payload) -> list[str]:
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k).lower()
+
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    if any(x in key for x in [
+                        "url", "media", "image", "photo", "video",
+                        "playback", "source", "src"
+                    ]):
+                        found.append(v)
+
+                walk(v)
+
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    tweet = payload.get("tweet", payload)
+    media = tweet.get("media", {})
+    walk(media)
+
+    result = []
+    seen = set()
+    for url in found:
+        if url not in seen:
+            seen.add(url)
+            result.append(url)
+
+    return result
+
+
+async def download_twitter_fx(url: str) -> dict:
+    parsed = parse_twitter_url(url)
+    if not parsed:
+        raise RuntimeError("Не удалось распарсить ссылку Twitter/X")
+
+    username, tweet_id = parsed
+    endpoint = f"https://api.fxtwitter.com/{username}/status/{tweet_id}"
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(endpoint) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+
+    tweet = data.get("tweet", data)
+    caption = None
+    if isinstance(tweet, dict):
+        text = tweet.get("text")
+        if isinstance(text, str) and text.strip():
+            caption = text.strip()
+
+    media_urls = extract_twitter_media_urls(data)
+    if not media_urls:
+        raise RuntimeError("FxTwitter не вернул медиа")
+
+    temp_dir = tempfile.mkdtemp(prefix="twitter_fx_")
+    files = []
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for i, media_url in enumerate(media_urls[:10], start=1):
+                async with session.get(media_url) as resp:
+                    resp.raise_for_status()
+
+                    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].lower()
+                    if not (
+                        content_type.startswith("image/")
+                        or content_type.startswith("video/")
+                        or content_type.startswith("audio/")
+                    ):
+                        continue
+
+                    parsed_media = urlparse(media_url)
+                    path_ext = Path(parsed_media.path).suffix.lower()
+                    ext = path_ext if path_ext in MEDIA_EXTS else guess_ext_from_content_type(content_type)
+
+                    file_path = Path(temp_dir) / f"tw_{i}{ext}"
+                    file_path.write_bytes(await resp.read())
+                    files.append(str(file_path))
+
+        if not files:
+            raise RuntimeError("Не удалось скачать файлы из медиа-ссылок FxTwitter")
+
+        return {
+            "temp_dir": temp_dir,
+            "files": files,
+            "caption": caption,
+        }
+
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+async def download_direct_image(url: str) -> dict:
+    temp_dir = tempfile.mkdtemp(prefix="img_bot_")
+    parsed = urlparse(url)
+    path_ext = Path(parsed.path).suffix.lower()
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type")
+                ext = path_ext if path_ext in IMAGE_EXTS else guess_ext_from_content_type(content_type, ".jpg")
+                file_path = Path(temp_dir) / f"image{ext}"
+                file_path.write_bytes(await resp.read())
+
+        return {"temp_dir": temp_dir, "files": [str(file_path)], "caption": None}
+
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+async def download_ytdlp(url: str) -> dict:
+    temp_dir = tempfile.mkdtemp(prefix="media_bot_")
+    outtmpl = str(Path(temp_dir) / "%(id)s.%(ext)s")
+
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "format": "bv*[height<=1080]+ba/b[height<=1080]",
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        files = []
+        for p in Path(temp_dir).iterdir():
+            if not p.is_file():
+                continue
+            if p.name.startswith("."):
+                continue
+            if p.suffix.lower() in {".part", ".ytdl", ".temp"}:
+                continue
+            files.append(p)
+
+        if not files:
+            raise FileNotFoundError("Файл после скачивания не найден")
+
+        files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+        return {
+            "temp_dir": temp_dir,
+            "files": [str(files[0])],
+            "caption": None,
+        }
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _download)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+async def send_local_media(message: Message, files: list[str], caption: str | None = None):
+    files = files[:10]
+    if not files:
+        raise RuntimeError("Нет файлов для отправки")
+
+    caption = (caption or "").strip()[:1024] or None
+
+    if len(files) == 1:
+        path = files[0]
+        ext = Path(path).suffix.lower()
+
+        if ext in IMAGE_EXTS:
+            await message.answer_photo(FSInputFile(path), caption=caption)
+            return
+
+        if ext in VIDEO_EXTS:
+            await message.answer_video(
+                FSInputFile(path),
+                caption=caption,
+                supports_streaming=True,
+            )
+            return
+
+        if ext in AUDIO_EXTS:
+            await message.answer_audio(FSInputFile(path), caption=caption)
+            return
+
+        await message.answer_document(FSInputFile(path), caption=caption)
+        return
+
+    album = []
+    leftovers = []
+
+    for path in files:
+        ext = Path(path).suffix.lower()
+        item_caption = caption if len(album) == 0 and caption else None
+
+        if ext in IMAGE_EXTS:
+            album.append(InputMediaPhoto(media=FSInputFile(path), caption=item_caption))
+        elif ext in VIDEO_EXTS:
+            album.append(InputMediaVideo(media=FSInputFile(path), caption=item_caption))
+        else:
+            leftovers.append(path)
+
+    if album:
+        await message.answer_media_group(media=album)
+
+    for i, path in enumerate(leftovers):
+        ext = Path(path).suffix.lower()
+        item_caption = caption if not album and i == 0 else None
+
+        if ext in AUDIO_EXTS:
+            await message.answer_audio(FSInputFile(path), caption=item_caption)
+        else:
+            await message.answer_document(FSInputFile(path), caption=item_caption)
+
+
+@dp.message()
+async def handle_link(message: Message):
+    deleted, urls = await moderate_links(message)
+    if deleted:
+        return
+
+    raw_text = (message.text or message.caption or "").strip()
+
+    if raw_text and is_reply_to_this_bot(message) and is_praise_text(raw_text):
+        await message.answer(random.choice(PRAISE_REPLIES))
+        return
+
+    if not urls:
+        if message.chat.type == "private" and raw_text:
+            await message.answer("Пришли мне ссылку на фото или видео.")
+        return
+
+    allowed_urls = [url for url in urls if is_allowed_media_link(url)]
+    if not allowed_urls:
+        if message.chat.type == "private":
+            await message.answer("Пришли мне ссылку на фото или видео.")
+        return
+
+    url = allowed_urls[0]
+
+    status = await message.answer("Скачиваю...")
+    temp_dirs: list[str] = []
+
+    try:
+        if is_tiktok(url):
+            data = await with_retry(download_tiktok, url)
+            title = (data.get("title") or "").strip()
+
+            images = data.get("images") or []
+            if images:
+                media = [
+                    InputMediaPhoto(
+                        media=img,
+                        caption=title[:1024] if i == 0 and title else None,
+                    )
+                    for i, img in enumerate(images[:10])
+                ]
+                await message.answer_media_group(media=media)
+                await safe_delete_message(status)
+                return
+
+            video_url = data.get("hdplay") or data.get("play") or data.get("play_addr")
+            if not video_url:
+                raise RuntimeError("TikWM не вернул ссылку на видео")
+
+            await message.answer_video(
+                video=video_url,
+                caption=title[:1024] if title else None,
+                supports_streaming=True,
+            )
+            await safe_delete_message(status)
+            return
+
+        if is_instagram(url):
+            result = await with_retry(download_instagram_apify, url)
+            temp_dirs.append(result["temp_dir"])
+            await send_local_media(message, result["files"], result.get("caption"))
+            await safe_delete_message(status)
+            return
+
+        if is_twitter(url):
+            result = await with_retry(download_twitter_fx, url)
+            temp_dirs.append(result["temp_dir"])
+            await send_local_media(message, result["files"], result.get("caption"))
+            await safe_delete_message(status)
+            return
+
+        if is_direct_image(url):
+            result = await with_retry(download_direct_image, url)
+            temp_dirs.append(result["temp_dir"])
+            await send_local_media(message, result["files"], result.get("caption"))
+            await safe_delete_message(status)
+            return
+
+        result = await with_retry(download_ytdlp, url)
+        temp_dirs.append(result["temp_dir"])
+
+        await status.edit_text("Отправляю...")
+        await send_local_media(message, result["files"], result.get("caption"))
+        await safe_delete_message(status)
+
+    except aiohttp.ClientResponseError as e:
+        text = str(e).lower()
+        if is_tiktok(url):
+            await status.edit_text("Хозяин, TikTok не отдал ничего... Попробуй ещё раз попозже, лапочка (⁠｡⁠・⁠/⁠/⁠ε⁠/⁠/⁠・⁠｡⁠)")
+        elif is_instagram(url):
+            await status.edit_text("Хозяин, Instagram почему-то не отдал ничего, Попробуй ещё разочек (⁠｡⁠・⁠/⁠/⁠ε⁠/⁠/⁠・⁠｡⁠)")
+        elif is_twitter(url):
+            if "404" in text:
+                await status.edit_text("Хозяин, Twitter/X пост не найден или его уже удалили, прости пожалуйста (⁠´⁠ ⁠.⁠ ⁠.̫⁠ ⁠.⁠ ⁠`⁠)")
+            else:
+                await status.edit_text("Хозяин,Twitter/X почему-то не отдал медиа. Попробуй чуть позже ^^")
+        else:
+            await status.edit_text("Упс, не получилось скачать (⁠´⁠ ⁠.⁠ ⁠.̫⁠ ⁠.⁠ ⁠`⁠) Не наказывай меня, Хозяин, но я не знаю почему")
+
+    except asyncio.TimeoutError:
+        await status.edit_text("Хозяин... сервер отвечает слишком долго... п-попробуйте ещё раз, пожалуйста... (つ﹏<。)")
+
+    except DownloadError as e:
+        await status.edit_text(human_ytdlp_error(e))
+
+    except TelegramBadRequest as e:
+        text = str(e).lower()
+        if "file is too big" in text or "request entity too large" in text:
+            await status.edit_text("Хозяин, я все ещё хороший мальчик, но телеграм не дает отправить это видео (⁠눈⁠‸⁠눈⁠)")
+        else:
+            await status.edit_text("Хозяин, я все ещё хороший мальчик, но телеграм не дает отправить это видео (⁠눈⁠‸⁠눈⁠)")
+
+    except Exception as e:
+        print(f"Unhandled error: {e}")
+        if is_instagram(url):
+            await status.edit_text(human_instagram_api_error(e))
+        elif is_twitter(url):
+            await status.edit_text(human_twitter_error(e))
+        else:
+            await status.edit_text("Хозяин... простите, пожалуйста... при обработке ссылки что-то пошло не так... TᴖT")
+
+    finally:
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def main():
+    print("🐾 Бот запущен! :3")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
