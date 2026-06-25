@@ -1,2 +1,4 @@
-python-telegram-bot>=21.0,<22.0
-yt-dlp>=2026.1.1
+aiogram
+aiohttp
+python-dotenv
+yt-dlp

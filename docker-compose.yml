@@ -1,0 +1,9 @@
+services:
+  media-bot:
+    build: .
+    container_name: media-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
