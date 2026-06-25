@@ -1,7 +1,7 @@
 services:
   media-bot:
     build: .
-    container_name: media-bot
+    container_name: cattemis-bot
     restart: unless-stopped
     env_file:
       - .env
