@@ -1,27 +1,30 @@
 import asyncio
+import json
 import os
+import re
 import random
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 import yt_dlp
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from yt_dlp.utils import DownloadError
 
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (
-    Message,
     FSInputFile,
     InputMediaPhoto,
     InputMediaVideo,
+    Message,
 )
-
 
 load_dotenv()
 
@@ -29,11 +32,26 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_INSTAGRAM_ACTOR = os.getenv("APIFY_INSTAGRAM_ACTOR", "elis~instagram-downloader-api")
 
+LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() == "true"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:e4b")
+LLM_SYSTEM_PROMPT = os.getenv(
+    "LLM_SYSTEM_PROMPT",
+    "Ты милый телеграм-бот. Отвечай кратко, дружелюбно и по делу. Не выдумывай факты. "
+    "Если не уверен — честно скажи об этом."
+)
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден в .env")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+llm_client = AsyncOpenAI(
+    api_key=LLM_API_KEY,
+    base_url=LLM_BASE_URL,
+) if LLM_ENABLED else None
 
 TIKWM_API = "https://www.tikwm.com/api/"
 
@@ -114,53 +132,24 @@ _last_api_call: float = 0.0
 BOT_USERNAME_CACHE: str | None = None
 
 PRAISE_REPLIES = [
-    "Хозяин, ты меня смущаешь (⁠｡⁠・⁠/⁠/⁠ε⁠/⁠/⁠・⁠｡⁠)",
-    "Хозяин, если ты продолжишь, я перегреюсь  ⁄⁠(⁠⁄⁠ ⁠⁄⁠•⁠⁄⁠-⁠⁄⁠•⁠⁄⁠ ⁠⁄⁠)⁠⁄",
-    "Похвала от Хозяина всегда самая лучшая ♡⁠(⁠Ӧ⁠ｖ⁠Ӧ⁠｡⁠)",
-    "Хозяин, прекрати меня хвалить, я уже краснею ૮꒰ ˃̶̤́ ⤙˂̶̤̀ ྀི ꒱ა",
-    "Хозяин, я твой хороший мальчик (⁠｡⁠・⁠//⁠ε⁠/⁠/⁠・⁠｡⁠)⁠",
-    "Смущаешь меня, Хозяин (˶ ｰ̀ ⤙ｰ́ ˶) ⁠",
-    "мяу мяу мяу мяу мяу~",
-    ">////<",
-    "Хозяин, продолжай меня хвалить пожалуйста(⁠｡⁠・⁠//⁠ε⁠/⁠/⁠・⁠｡⁠)⁠",
-    "Х-Хозяин, х-хватит... (˶ ｰ̀ ⤙ｰ́ ˶) ",
-    "Хозяин, мои ушки покраснели (⸝⸝๑  ̫ ๑⸝⸝⸝)",
-    "Х-хозяин!! ♡⸝⸝› ༝ ‹⸝⸝♡  к-каждый раз думая о тебе, мое сердечко делает тук-тук быстроооо!! н-надеюсь у тебя т-так же…",
-    "Я такой не послушный м-мальчик… совсем не слушаюсь своего господина… ( -᷄ ₃ -᷄ )... неужели хозяин накажет меня с-снова… я люблю когда он меня б-бьет..!",
-    "М-можно к вам на р-ручки, но только не т-трогайте меня за пипи..!! ( ,,ｰ̀⤚ｰ́,,) ₌₃",
-    "О-ой.. я наверно в-весь покраснел, это в-вы виноваты, г-господин кьяяя!!! ",
-    "У меня снизу с-стало мокро… п-помогите мне п-пожалуйста г-господин!… я не могу с-сдержаться…",
-    "Г-господин, мне сесть к вам на коленки??… но я с-снова буду чувствовать ч-что твердое снизу…",
+    "ананас",
 ]
 
 PRAISE_KEYWORDS = [
-    "хороший бот",
-    "бот молодец",
-    "молодец бот",
-    "умничка",
-    "умница",
-    "лапочка",
-    "лучший бот",
-    "бот лучший",
-    "омежка",
-    "молодец",
-    "молодчина",
-    "nice bot",
-    "колени",
-    "милашка",
-    "nice cock",
-    "няшка",
-    "похвалить бота",
-    "няшка",
-    "котик",
-    "жаным",
-    "люблю",
-    "зацелую",
-    "милаш",
-    "милый",
-    "мой",
-    "милаш",
+    "огурец",
 ]
+
+ARTISTS_CONFIG_PATH = Path(__file__).parent / "artists.json"
+
+
+@dataclass
+class ArtistLink:
+    artist_id: str
+    label: str
+    url: str
+
+
+_artists_cache: list[ArtistLink] = []
 
 
 def get_chat_lock(chat_id: int) -> asyncio.Lock:
@@ -186,7 +175,9 @@ async def safe_status_edit(status: Message, text: str) -> None:
         pass
 
 
-async def safe_delete_message(message: Message):
+async def safe_delete_message(message: Message | None):
+    if not message:
+        return
     try:
         await tg_call(message.delete)
     except Exception:
@@ -316,7 +307,6 @@ def extract_urls_from_message(message: Message) -> list[str]:
 def is_praise_text(text: str) -> bool:
     if not text:
         return False
-
     normalized = " ".join(text.lower().strip().split())
     return any(keyword in normalized for keyword in PRAISE_KEYWORDS)
 
@@ -331,7 +321,6 @@ def is_reply_to_this_bot(message: Message) -> bool:
 async def is_bot_mentioned(message: Message) -> bool:
     text = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
-
     bot_username = await get_bot_username()
     if not bot_username:
         return False
@@ -379,7 +368,6 @@ async def get_admin_ids(chat_id: int) -> set[int]:
 async def is_admin_message(message: Message) -> bool:
     if not message.from_user:
         return False
-
     if message.chat.type not in GROUP_CHAT_TYPES:
         return False
 
@@ -405,7 +393,6 @@ async def moderate_links(message: Message) -> tuple[bool, list[str]]:
         return False, urls
 
     has_bad_links = any(not is_allowed_media_link(url) for url in urls)
-
     if has_bad_links:
         try:
             await message.delete()
@@ -459,10 +446,8 @@ async def with_retry(func, *args, attempts: int = RETRY_ATTEMPTS, delay: float =
             return await func(*args, **kwargs)
         except Exception as e:
             last_error = e
-
             if attempt >= attempts or not is_retryable_exception(e):
                 raise
-
             await asyncio.sleep(delay)
 
     raise last_error
@@ -490,6 +475,7 @@ def human_ytdlp_error(error: Exception) -> str:
 
 def human_instagram_api_error(error: Exception) -> str:
     text = str(error).lower()
+
     if "apify_token" in text:
         return "П-простите, хозяин... APIFY_TOKEN не задан... ૮(˶ㅠ︿ㅠ)ა"
     if "http 401" in text or "http 403" in text:
@@ -552,11 +538,11 @@ def extract_media_urls(obj) -> list[str]:
     found = []
     skip_keys = {
         "thumbnail", "thumb", "avatar", "profile", "icon", "logo",
-        "permalink", "shortcode", "posturl", "pageurl"
+        "permalink", "shortcode", "posturl", "pageurl",
     }
     good_keys = {
         "video", "image", "photo", "display", "download",
-        "src", "media", "url", "play"
+        "src", "media", "url", "play",
     }
 
     def walk(value):
@@ -584,6 +570,7 @@ def extract_media_urls(obj) -> list[str]:
         if url not in seen:
             seen.add(url)
             dedup.append(url)
+
     return dedup
 
 
@@ -629,7 +616,7 @@ async def download_instagram_apify(url: str) -> dict:
                         caption = value.strip()
                         break
 
-        media_urls.extend(extract_media_urls(item))
+            media_urls.extend(extract_media_urls(item))
 
     dedup_urls = []
     seen = set()
@@ -674,7 +661,6 @@ async def download_instagram_apify(url: str) -> dict:
             "files": files,
             "caption": caption,
         }
-
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -701,10 +687,7 @@ def extract_twitter_media_urls(payload) -> list[str]:
                 key = str(k).lower()
 
                 if isinstance(v, str) and v.startswith(("http://", "https://")):
-                    if any(x in key for x in [
-                        "url", "media", "image", "photo", "video",
-                        "playback", "source", "src"
-                    ]):
+                    if any(x in key for x in ["url", "media", "image", "photo", "video", "playback", "source", "src"]):
                         found.append(v)
 
                 walk(v)
@@ -714,7 +697,7 @@ def extract_twitter_media_urls(payload) -> list[str]:
                 walk(item)
 
     tweet = payload.get("tweet", payload)
-    media = tweet.get("media", {})
+    media = tweet.get("media", {}) if isinstance(tweet, dict) else {}
     walk(media)
 
     result = []
@@ -785,7 +768,6 @@ async def download_twitter_fx(url: str) -> dict:
             "files": files,
             "caption": caption,
         }
-
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -807,7 +789,6 @@ async def download_direct_image(url: str) -> dict:
                 file_path.write_bytes(await resp.read())
 
         return {"temp_dir": temp_dir, "files": [str(file_path)], "caption": None}
-
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -917,55 +898,101 @@ async def send_local_media(message: Message, files: list[str], caption: str | No
             await tg_call(message.answer_document, FSInputFile(path), caption=item_caption)
 
 
-@dp.message(Command("say_cattemis"))
-async def cmd_say(message: Message):
-    if not await can_use_say(message):
+def load_artists_config() -> None:
+    global _artists_cache
+
+    if not ARTISTS_CONFIG_PATH.exists():
+        print(f"[artists] файл {ARTISTS_CONFIG_PATH} не найден, /art работать не будет")
+        _artists_cache = []
         return
 
-    raw_text = (message.text or "").strip()
-    payload = raw_text.partition(" ")[2].strip()
+    with ARTISTS_CONFIG_PATH.open("r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    if not payload and message.reply_to_message:
-        payload = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    artists = data.get("artists") or []
+    links: list[ArtistLink] = []
 
-    if not payload:
-        await tg_call(message.answer, "Использование: /say текст\nИли ответь на сообщение командой /say")
-        return
+    for artist in artists:
+        if not artist.get("enabled", True):
+            continue
 
-    async with get_chat_lock(message.chat.id):
-        await tg_call(message.answer, payload)
+        artist_id = str(artist.get("id") or "").strip()
+        label = str(artist.get("label") or artist_id or "artist").strip()
+        urls = artist.get("urls") or []
 
-    await safe_delete_message(message)
+        for raw_url in urls:
+            url = normalize_possible_url(str(raw_url))
+            if not url:
+                continue
+            links.append(ArtistLink(artist_id=artist_id, label=label, url=url))
+
+    _artists_cache = links
+    print(f"[artists] загружено {len(_artists_cache)} ссылок")
 
 
-@dp.message()
-async def handle_link(message: Message):
-    deleted, urls = await moderate_links(message)
-    if deleted:
-        return
+def random_artist_link(artist_id: str | None = None) -> ArtistLink | None:
+    if not _artists_cache:
+        return None
 
-    raw_text = (message.text or message.caption or "").strip()
+    if artist_id:
+        candidates = [l for l in _artists_cache if l.artist_id.lower() == artist_id.lower()]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
-    if raw_text.startswith("/"):
-        return
+    return random.choice(_artists_cache)
 
-    if await is_praise_for_bot(message):
-        await tg_call(message.answer, random.choice(PRAISE_REPLIES))
-        return
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002600-\U000026FF"
+    "\U00002700-\U000027BF"
+    "]+",
+    flags=re.UNICODE,
+)
 
-    if not urls:
-        if message.chat.type == "private" and raw_text:
-            await tg_call(message.answer, "Пришли мне ссылку на фото или видео.")
-        return
+def strip_unicode_emoji(text: str) -> str:
+    return EMOJI_RE.sub("", text)
 
-    allowed_urls = [url for url in urls if is_allowed_media_link(url)]
-    if not allowed_urls:
-        if message.chat.type == "private":
-            await tg_call(message.answer, "Пришли мне ссылку на фото или видео.")
-        return
+def cleanup_llm_text(text: str) -> str:
+    text = strip_unicode_emoji(text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" ?([,.;:!?]){2,}", r"\1", text)
+    return text.strip()
 
-    url = allowed_urls[0]
-    status = await tg_call(message.answer, "Скачиваю...")
+async def ask_llm(user_text: str, user_name: str | None = None) -> str:
+    if not LLM_ENABLED:
+        return "LLM отключён."
+
+    display_name = (user_name or "user").strip() or "user"
+
+    response = await llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"User name: {display_name}\nMessage: {user_text}",
+            },
+        ],
+        temperature=0.4,
+        max_tokens=120,
+    )
+
+    text = response.choices[0].message.content or ""
+    text = cleanup_llm_text(text)
+    return text or "..."
+
+async def process_media_url(message: Message, url: str, initial_status_text: str = "Скачиваю..."):
+    status = await tg_call(message.answer, initial_status_text)
     temp_dirs: list[str] = []
 
     try:
@@ -998,7 +1025,7 @@ async def handle_link(message: Message):
                     supports_streaming=True,
                 )
                 await safe_delete_message(status)
-            return
+                return
 
         if is_instagram(url):
             result = await with_retry(download_instagram_apify, url)
@@ -1007,7 +1034,7 @@ async def handle_link(message: Message):
                 await safe_status_edit(status, "Отправляю...")
                 await send_local_media(message, result["files"], result.get("caption"))
                 await safe_delete_message(status)
-            return
+                return
 
         if is_twitter(url):
             result = await with_retry(download_twitter_fx, url)
@@ -1016,7 +1043,7 @@ async def handle_link(message: Message):
                 await safe_status_edit(status, "Отправляю...")
                 await send_local_media(message, result["files"], result.get("caption"))
                 await safe_delete_message(status)
-            return
+                return
 
         if is_direct_image(url):
             result = await with_retry(download_direct_image, url)
@@ -1025,7 +1052,7 @@ async def handle_link(message: Message):
                 await safe_status_edit(status, "Отправляю...")
                 await send_local_media(message, result["files"], result.get("caption"))
                 await safe_delete_message(status)
-            return
+                return
 
         result = await with_retry(download_ytdlp, url)
         temp_dirs.append(result["temp_dir"])
@@ -1063,7 +1090,7 @@ async def handle_link(message: Message):
         await safe_status_edit(status, "Хозяин... Telegram попросил меня подождать немножко, попробуй ещё разочек ^^")
 
     except Exception as e:
-        print(f"Unhandled error: {e}")
+        print(f"[media] Unhandled error for {url}: {e}")
         if is_instagram(url):
             await safe_status_edit(status, human_instagram_api_error(e))
         elif is_twitter(url):
@@ -1076,8 +1103,119 @@ async def handle_link(message: Message):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+@dp.message(Command("say_cattemis"))
+async def cmd_say(message: Message):
+    if not await can_use_say(message):
+        return
+
+    raw_text = (message.text or "").strip()
+    payload = raw_text.partition(" ")[2].strip()
+
+    if not payload and message.reply_to_message:
+        payload = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+
+    if not payload:
+        await tg_call(message.answer, "Использование: /say_cattemis текст\nИли ответь на сообщение командой /say_cattemis")
+        return
+
+    async with get_chat_lock(message.chat.id):
+        await tg_call(message.answer, payload)
+
+    await safe_delete_message(message)
+
+
+@dp.message(Command("gamble_cattemis"))
+@dp.message(Command("art"))
+async def cmd_art(message: Message):
+    print(f"[art] command from chat={message.chat.id}")
+
+    link = random_artist_link()
+    if not link:
+        await tg_call(message.answer, "Хозяин, artists.json пустой или все художники выключены...")
+        return
+
+    await process_media_url(message, link.url, initial_status_text=f"Скачиваю артик от {link.label}...")
+
+
+@dp.message(Command("artist"))
+async def cmd_artist(message: Message):
+    raw_text = (message.text or "").strip()
+    artist_id = raw_text.partition(" ")[2].strip()
+
+    if not artist_id:
+        await tg_call(message.answer, "Использование: /artist <id>")
+        return
+
+    link = random_artist_link(artist_id)
+    if not link:
+        await tg_call(message.answer, f"Хозяин, для artist_id='{artist_id}' ничего не найдено.")
+        return
+
+    await process_media_url(message, link.url, initial_status_text=f"Скачиваю артик от {link.label}...")
+
+
+@dp.message()
+async def handle_link(message: Message):
+    deleted, urls = await moderate_links(message)
+    if deleted:
+        return
+
+    raw_text = (message.text or message.caption or "").strip()
+
+    if raw_text.startswith("/"):
+        return
+
+    if await is_praise_for_bot(message):
+        await tg_call(message.answer, random.choice(PRAISE_REPLIES))
+        return
+
+    if urls:
+        allowed_urls = [url for url in urls if is_allowed_media_link(url)]
+        if not allowed_urls:
+            if message.chat.type == "private":
+                await tg_call(message.answer, "Пришли мне ссылку на фото или видео.")
+            return
+
+        await process_media_url(message, allowed_urls[0], initial_status_text="Скачиваю...")
+        return
+
+    if not raw_text:
+        return
+
+    should_use_llm = False
+    if LLM_ENABLED:
+        if message.chat.type == "private":
+            should_use_llm = True
+        elif is_reply_to_this_bot(message) or await is_bot_mentioned(message):
+            should_use_llm = True
+
+    if should_use_llm:
+        status = await tg_call(message.answer, "Думаю...")
+        try:
+            reply = await ask_llm(
+                raw_text,
+                user_name=message.from_user.first_name if message.from_user else None,
+            )
+            await safe_delete_message(status)
+            await tg_call(message.answer, reply)
+        except Exception as e:
+            print(f"[llm] error: {e}")
+            await safe_status_edit(status, "Хозяин... я задумался слишком сильно и не смог ответить TᴖT")
+        return
+
+    if message.chat.type == "private":
+        await tg_call(message.answer, "Пришли мне ссылку на фото или видео.")
+
+
 async def main():
     print("🐾 Бот запущен! :3")
+    load_artists_config()
+
+    if LLM_ENABLED:
+        print(f"[llm] enabled, base_url={LLM_BASE_URL}, model={LLM_MODEL}")
+    else:
+        print("[llm] disabled")
+
     await dp.start_polling(bot)
 
 
