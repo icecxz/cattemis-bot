@@ -1226,6 +1226,21 @@ async def process_media_url(message: Message, url: str, initial_status_text: str
         for temp_dir in temp_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    help_text = (
+        "🐾 Cattemis Bot\n\n"
+        "Я умею скачивать медиа из TikTok, Instagram, X/Twitter, "
+        "YouTube, Vimeo и прямых ссылок на фото/видео.\n\n"
+        "Команды:\n"
+        "/help — показать это сообщение\n"
+        "/art — отправить случайный арт\n"
+        "/artist <id> — отправить арт по id художника\n"
+        "/say_cattemis <text> — повторить текст от имени бота\n\n"
+        "Просто отправь мне ссылку на фото или видео, и я попробую скачать её."
+    )
+
+    await tg_call(message.answer, help_text)
 
 @dp.message(Command("say_cattemis"))
 async def cmd_say(message: Message):
