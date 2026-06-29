@@ -24,7 +24,9 @@ from aiogram.types import (
     InputMediaPhoto,
     InputMediaVideo,
     Message,
+    ReplyParameters,
 )
+from aiogram.utils.chat_action import ChatActionSender
 
 load_dotenv()
 
@@ -38,8 +40,8 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:e4b")
 LLM_SYSTEM_PROMPT = os.getenv(
     "LLM_SYSTEM_PROMPT",
-    "Ты милый телеграм-бот. Отвечай кратко, дружелюбно и по делу. Не выдумывай факты. "
-    "Если не уверен — честно скажи об этом."
+    "Ты милый телеграм-бот. Отвечай кратко, дружелюбно и по делу. "
+    "Не выдумывай факты. Если не уверен — честно скажи об этом.",
 )
 
 if not BOT_TOKEN:
@@ -62,11 +64,13 @@ TIKTOK_DOMAINS = {
     "vm.tiktok.com",
     "vt.tiktok.com",
 }
+
 INSTAGRAM_DOMAINS = {
     "instagram.com",
     "www.instagram.com",
     "m.instagram.com",
 }
+
 TWITTER_DOMAINS = {
     "x.com",
     "www.x.com",
@@ -74,12 +78,14 @@ TWITTER_DOMAINS = {
     "www.twitter.com",
     "mobile.twitter.com",
 }
+
 YOUTUBE_DOMAINS = {
     "youtube.com",
     "www.youtube.com",
     "m.youtube.com",
     "youtu.be",
 }
+
 VIMEO_DOMAINS = {
     "vimeo.com",
     "www.vimeo.com",
@@ -129,7 +135,9 @@ _admin_cache: dict[int, tuple[float, set[int]]] = {}
 _chat_locks: dict[int, asyncio.Lock] = {}
 _api_lock = asyncio.Lock()
 _last_api_call: float = 0.0
+
 BOT_USERNAME_CACHE: str | None = None
+BOT_ID_CACHE: int | None = None
 
 PRAISE_REPLIES = [
     "ананас",
@@ -200,6 +208,14 @@ async def get_bot_username() -> str:
         me = await bot.get_me()
         BOT_USERNAME_CACHE = (me.username or "").lower()
     return BOT_USERNAME_CACHE
+
+
+async def get_bot_id() -> int:
+    global BOT_ID_CACHE
+    if BOT_ID_CACHE is None:
+        me = await bot.get_me()
+        BOT_ID_CACHE = me.id
+    return BOT_ID_CACHE
 
 
 def normalize_possible_url(url: str) -> str:
@@ -311,16 +327,17 @@ def is_praise_text(text: str) -> bool:
     return any(keyword in normalized for keyword in PRAISE_KEYWORDS)
 
 
-def is_reply_to_this_bot(message: Message) -> bool:
+async def is_reply_to_this_bot(message: Message) -> bool:
     reply = message.reply_to_message
     if not reply or not reply.from_user:
         return False
-    return reply.from_user.id == bot.id
+    return reply.from_user.id == await get_bot_id()
 
 
 async def is_bot_mentioned(message: Message) -> bool:
     text = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
+
     bot_username = await get_bot_username()
     if not bot_username:
         return False
@@ -341,7 +358,7 @@ async def is_praise_for_bot(message: Message) -> bool:
     if not raw_text or not is_praise_text(raw_text):
         return False
 
-    if is_reply_to_this_bot(message):
+    if await is_reply_to_this_bot(message):
         return True
 
     if await is_bot_mentioned(message):
@@ -537,12 +554,27 @@ async def download_tiktok(url: str) -> dict:
 def extract_media_urls(obj) -> list[str]:
     found = []
     skip_keys = {
-        "thumbnail", "thumb", "avatar", "profile", "icon", "logo",
-        "permalink", "shortcode", "posturl", "pageurl",
+        "thumbnail",
+        "thumb",
+        "avatar",
+        "profile",
+        "icon",
+        "logo",
+        "permalink",
+        "shortcode",
+        "posturl",
+        "pageurl",
     }
     good_keys = {
-        "video", "image", "photo", "display", "download",
-        "src", "media", "url", "play",
+        "video",
+        "image",
+        "photo",
+        "display",
+        "download",
+        "src",
+        "media",
+        "url",
+        "play",
     }
 
     def walk(value):
@@ -942,6 +974,7 @@ def random_artist_link(artist_id: str | None = None) -> ArtistLink | None:
 
     return random.choice(_artists_cache)
 
+
 EMOJI_RE = re.compile(
     "["
     "\U0001F300-\U0001F5FF"
@@ -958,8 +991,10 @@ EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 
+
 def strip_unicode_emoji(text: str) -> str:
     return EMOJI_RE.sub("", text)
+
 
 def cleanup_llm_text(text: str) -> str:
     text = strip_unicode_emoji(text)
@@ -968,33 +1003,35 @@ def cleanup_llm_text(text: str) -> str:
     text = re.sub(r" ?([,.;:!?]){2,}", r"\1", text)
     return text.strip()
 
+
 async def ask_llm(user_text: str, user_name: str | None = None) -> str:
-    if not LLM_ENABLED:
+    if not LLM_ENABLED or llm_client is None:
         return "LLM отключён."
 
     display_name = (user_name or "user").strip() or "user"
 
     response = await llm_client.chat.completions.create(
-    model=LLM_MODEL,
-    messages=[
-        {"role": "system", "content": LLM_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": f"User name: {display_name}\nMessage: {user_text}",
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"User name: {display_name}\nMessage: {user_text}",
+            },
+        ],
+        temperature=0.4,
+        max_tokens=240,
+        extra_body={
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+            }
         },
-    ],
-    temperature=0.4,
-    max_tokens=240,
-    extra_body={
-        "chat_template_kwargs": {
-            "enable_thinking": False
-        }
-    },
-)
+    )
 
     text = response.choices[0].message.content or ""
     text = cleanup_llm_text(text)
     return text or "..."
+
 
 async def process_media_url(message: Message, url: str, initial_status_text: str = "Скачиваю..."):
     status = await tg_call(message.answer, initial_status_text)
@@ -1191,21 +1228,35 @@ async def handle_link(message: Message):
     if LLM_ENABLED:
         if message.chat.type == "private":
             should_use_llm = True
-        elif is_reply_to_this_bot(message) or await is_bot_mentioned(message):
+        elif await is_reply_to_this_bot(message) or await is_bot_mentioned(message):
             should_use_llm = True
 
     if should_use_llm:
-        status = await tg_call(message.answer, "Думаю...")
         try:
-            reply = await ask_llm(
-                raw_text,
-                user_name=message.from_user.first_name if message.from_user else None,
+            async with ChatActionSender.typing(
+                bot=bot,
+                chat_id=message.chat.id,
+                message_thread_id=message.message_thread_id,
+            ):
+                reply = await ask_llm(
+                    raw_text,
+                    user_name=message.from_user.first_name if message.from_user else None,
+                )
+
+            reply = reply.strip()[:4000] or "..."
+
+            await tg_call(
+                message.answer,
+                reply,
+                reply_parameters=ReplyParameters(message_id=message.message_id),
             )
-            await safe_delete_message(status)
-            await tg_call(message.answer, reply)
         except Exception as e:
             print(f"[llm] error: {e}")
-            await safe_status_edit(status, "Хозяин... я задумался слишком сильно и не смог ответить TᴖT")
+            await tg_call(
+                message.answer,
+                "Хозяин... я задумался слишком сильно и не смог ответить TᴖT",
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
         return
 
     if message.chat.type == "private":
