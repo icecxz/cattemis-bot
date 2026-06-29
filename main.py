@@ -1053,6 +1053,18 @@ def cleanup_llm_text(text: str) -> str:
     text = re.sub(r" ?([,.;:!?]){2,}", r"\1", text)
     return text.strip()
 
+def fix_truncated_kaomoji(text: str) -> str:
+    if not text:
+        return text
+
+    if re.search(r">\/{2,}$", text):
+        text += "<"
+
+    if text.endswith(">///"):
+        text += "/<"
+
+    return text
+
 
 async def ask_llm(chat_id: int, user_text: str, user_name: str | None = None) -> str:
     if not LLM_ENABLED or llm_client is None:
@@ -1060,7 +1072,6 @@ async def ask_llm(chat_id: int, user_text: str, user_name: str | None = None) ->
 
     display_name = (user_name or "user").strip() or "user"
     history = get_chat_history(chat_id)
-
     user_content = f"{display_name}: {user_text}"
 
     messages = [
@@ -1074,16 +1085,24 @@ async def ask_llm(chat_id: int, user_text: str, user_name: str | None = None) ->
         messages=messages,
         temperature=0.4,
         max_tokens=100,
+        extra_body={
+            "thinking": {
+                "type": "disabled"
+            }
+        },
     )
 
-    text = response.choices[0].message.content or ""
-    text = cleanup_llm_text(text) or "..."
+    choice = response.choices[0]
+    print(f"[llm] finish_reason={choice.finish_reason!r}")
+
+    text = choice.message.content or ""
+    text = cleanup_llm_text(text)
+    text = fix_truncated_kaomoji(text)
 
     append_chat_history(chat_id, "user", user_content)
-    append_chat_history(chat_id, "assistant", text)
+    append_chat_history(chat_id, "assistant", text or "...")
 
-    return text
-
+    return text or "..."
 
 async def process_media_url(message: Message, url: str, initial_status_text: str = "Скачиваю..."):
     status = await tg_call(message.answer, initial_status_text)
@@ -1269,7 +1288,7 @@ async def cmd_reset(message: Message):
     clear_chat_history(message.chat.id)
     await tg_call(
         message.answer,
-        "Память диалога для этого чата очищена.",
+        "Память диалога для этого чата очищена, мяу~",
         reply_parameters=ReplyParameters(message_id=message.message_id),
         parse_mode=None,
     )
