@@ -975,17 +975,22 @@ async def ask_llm(user_text: str, user_name: str | None = None) -> str:
     display_name = (user_name or "user").strip() or "user"
 
     response = await llm_client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": LLM_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"User name: {display_name}\nMessage: {user_text}",
-            },
-        ],
-        temperature=0.4,
-        max_tokens=120,
-    )
+    model=LLM_MODEL,
+    messages=[
+        {"role": "system", "content": LLM_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"User name: {display_name}\nMessage: {user_text}",
+        },
+    ],
+    temperature=0.4,
+    max_tokens=240,
+    extra_body={
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        }
+    },
+)
 
     text = response.choices[0].message.content or ""
     text = cleanup_llm_text(text)
